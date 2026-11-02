@@ -1,0 +1,136 @@
+diff --git a/serve/web/app.js b/serve/web/app.js
+index 6c7d5184..02ed7f31 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -464,13 +464,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   $("state-bar").style.width = `${pct}%`;
+ 
+   // the eight cards
+-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
++  // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
++  // (token-weighted, the same figure the engine's DONE lines and Prometheus report). Live stays live.
++  const avgDecode = totals && totals.decode_ms > 0 && totals.output_tokens > 0 ? totals.output_tokens / (totals.decode_ms / 1000) : null;
++  const readTokens = totals ? totals.prompt_tokens - (totals.reused || 0) : 0;
++  const avgPrefill = totals && totals.prompt_ms > 0 && readTokens > 0 ? readTokens / (totals.prompt_ms / 1000) : null;
++  const speed = live.state === "generating" ? live.tok_s : avgDecode != null ? avgDecode : last ? last.decode_tok_s : null;
+   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
+-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
++            live.state === "generating" ? "Decode now" : avgDecode != null ? "Decode · run average" : last ? "Decode last request" : "Decode");
+   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
++                : avgPrefill != null ? avgPrefill : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
+-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
++            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : avgPrefill != null ? "Prefill · run average" : last ? "Prefill last request" : "Prefill");
+   spark("sp-speed", h.tok_s);
+   spark("sp-prefill", h.prefill_tok_s_mean);
+   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+diff --git a/serve/web/monitor.html b/serve/web/monitor.html
+index c1e87e7c..439c7e16 100644
+--- a/serve/web/monitor.html
++++ b/serve/web/monitor.html
+@@ -23,7 +23,7 @@ header{height:70px;padding:0 32px;display:flex;align-items:center;justify-conten
+ <div class="card"><div class="label">Model</div><div id="model-state" class="value"><span class="dot"></span><span id="loaded">Connecting…</span></div><div id="model" class="model">127.0.0.1:5001/v1</div></div>
+ <div class="card"><div class="label">Requests retained</div><div id="count" class="value">—</div><div id="active" class="small">Waiting for server</div></div>
+ <div class="card"><div class="label">Last wall-clock</div><div id="wall" class="value">—</div><div class="small">Includes queue and model loading</div></div>
+-<div class="card"><div class="label">Last decode speed</div><div id="speed" class="value">—</div><div class="small">Engine timing · tokens / second</div></div>
++<div class="card"><div class="label">Average decode speed</div><div id="speed" class="value">—</div><div class="small">Run average · tokens / second</div></div>
+ </div>
+ <section class="panel"><div class="panel-bar"><h2>Requests</h2><div class="filters"><input id="search" aria-label="Filter requests" placeholder="Search ID or endpoint"><select id="filter" aria-label="Request status"><option value="all">All statuses</option><option value="active">Active</option><option value="completed">Completed</option><option value="error">Errors</option></select></div></div>
+ <div class="workspace"><div id="requests" class="requests" aria-label="Request list"></div><div class="detail">
+diff --git a/serve/web/monitor.js b/serve/web/monitor.js
+index 5543b94b..59aa9ad4 100644
+--- a/serve/web/monitor.js
++++ b/serve/web/monitor.js
+@@ -6,6 +6,19 @@ document.documentElement.dataset.theme = localStorage.getItem("strata.theme") ||
+ const seconds = n => typeof n === "number" ? `${n.toFixed(2)} s` : "—";
+ const speed = n => typeof n === "number" ? n.toFixed(1) : "—";
+ const active = r => !["completed", "error", "disconnected"].includes(r.state);
++// The run's average decode speed: every token produced over the run divided by the run's decode time, from each
++// finished request's engine timings (predicted_n over predicted_ms). Token-weighted, so a short request does not
++// outweigh a long one - the same figure the engine's DONE lines and the server's totals report. Not the last request.
++function averageDecodeSpeed(rows) {
++  let tokens = 0, ms = 0;
++  for (const r of rows) {
++    const t = r.timings;
++    if (!t) continue;
++    const n = t.predicted_n, d = t.predicted_ms;
++    if (typeof n === "number" && typeof d === "number" && n >= 2 && d > 0) { tokens += n; ms += d; }
++  }
++  return ms > 0 ? tokens / (ms / 1000) : null;
++}
+ function text(id, value) { const el = $(id); if (el.textContent !== String(value)) el.textContent = value; }
+ async function api(path, body) {
+   const response = await fetch(path, {cache:"no-store", headers:{...(apiKey ? {Authorization:`Bearer ${apiKey}`} : {}), ...(body !== undefined ? {"Content-Type":"application/json"} : {})}, ...(body !== undefined ? {method:"POST", body:JSON.stringify(body)} : {})});
+@@ -85,7 +98,7 @@ async function refresh() {
+     text("model", status.model); text("count", records.length);
+     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
+     const last = records.find(r => !active(r));
+-    text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
++    text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(averageDecodeSpeed(records.filter(r => !active(r)))));
+     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
+     list(); if (selected) await showDetail();
+     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);
+diff --git a/strata_cli/overview.py b/strata_cli/overview.py
+index 76125aec..a423e773 100644
+--- a/strata_cli/overview.py
++++ b/strata_cli/overview.py
+@@ -61,6 +61,16 @@ def request_speed(r: dict) -> float | None:
+     return round(out / (ms / 1000.0), 1) if out and out >= 2 and ms and ms > 0 else None   # one token has no decode span (a probe showed 1,250 tok/s)
+ 
+ 
++def run_average_speed(metrics: dict) -> float | None:
++    """The run's average decode speed: every token the server produced over the whole run divided by the run's
++    decode time (the server's `totals`, the same token-weighted figure the engine's DONE lines and Prometheus use).
++    Not the last request's speed - a single request is noisy; this is the average over everything since the start.
++    None when the server reported no totals (never an invented zero)."""
++    totals = metrics.get("totals") or {}
++    out, ms = _num(totals.get("output_tokens")), _num(totals.get("decode_ms"))
++    return round(out / (ms / 1000.0), 1) if out and out >= 2 and ms and ms > 0 else None
++
++
+ def _cards(hw: dict, static: dict) -> list[dict]:
+     """Each graphics card's own readings when the server lists two or more (hardware.gpus); [] for one card or none: the Overview then
+     draws exactly what it always drew."""
+@@ -125,7 +135,10 @@ def build(metrics: dict | None) -> dict | None:
+     elif state == "Reading" and _num(live.get("prefill_tok_s_mean")) is not None:
+         speed, speed_note = _num(live.get("prefill_tok_s_mean")), "reading the prompt"
+     else:
+-        speed, speed_note = (request_speed(last) if last else None), "last request"
++        # Idle: not the last request's speed (one request is noisy) but the run's average, from the server's totals.
++        speed, speed_note = run_average_speed(metrics), "average of the run"
++        if speed is None:
++            speed, speed_note = (request_speed(last) if last else None), "last request"
+     slots, total_slots = _num(engine.get("expert_slots")), _num(engine.get("experts"))
+     cache_mib = _num(engine.get("expert_cache_mib"))
+     gen, genmax, width = _num(hw.get("gpu_pcie_gen")), _num(hw.get("gpu_pcie_gen_max")), _num(hw.get("gpu_pcie_width"))
+diff --git a/tests/terminal/test_overview.py b/tests/terminal/test_overview.py
+index fe40925f..5f517705 100644
+--- a/tests/terminal/test_overview.py
++++ b/tests/terminal/test_overview.py
+@@ -32,7 +32,9 @@ def metrics(state="reading", **over):
+          "requests": [{"id": "a", "time": now - 5, "duration_s": 429.8, "finish_reason": "stop", "prompt_tokens": 17183, "reused": 0,
+                        "output_tokens": 19511, "decode_ms": 386000},
+                       {"id": "b", "time": now - 9, "duration_s": 4.0, "finish_reason": "stop", "prompt_tokens": 626, "reused": 0,
+-                       "output_tokens": 11, "decode_ms": 410}]}
++                       "output_tokens": 11, "decode_ms": 410}],
++          "totals": {"requests": 12, "prompt_tokens": 90000, "reused": 5000, "output_tokens": 40000,
++                     "prompt_ms": 120000.0, "decode_ms": 1000000.0}}
+     m.update(over)
+     return m
+ 
+@@ -58,11 +60,11 @@ class Build(unittest.TestCase):
+         self.assertEqual(m["context"][0], 36742 + 120)
+         self.assertEqual(m["progress"], (120.0, 4096.0))
+ 
+-    def test_idle_shows_the_last_request(self):
++    def test_idle_shows_the_run_average(self):
+         m = overview.build(metrics("idle"))
+         self.assertEqual(m["state"], "Idle")
+-        self.assertEqual(m["speed"][1], "last request")
+-        self.assertAlmostEqual(m["speed"][0], 50.5, places=1)               # 19511 tokens in 386 s
++        self.assertEqual(m["speed"][1], "average of the run")
++        self.assertAlmostEqual(m["speed"][0], 40.0, places=1)               # totals: 40000 tokens in 1000 s, not the last request's 50.5
+         self.assertEqual(m["context"][0], 17183 + 19511)
+         self.assertEqual(m["progress"], (None, None))
+ 
